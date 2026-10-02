@@ -1,0 +1,1127 @@
+#!/bin/zsh
+# mdw: a live markdown viewer for the terminal.
+#
+# Renders a markdown file through glow (with the bundled Rose Pine styles and a
+# layout pass in lib/mdw/render.py), keeps the result in a buffer, and shows one
+# screenful at a time on the alternate screen with its own scroll offset.
+#
+# Hold-position reload: when the file changes on disk the buffer is rebuilt but
+# the view stays at the same scroll offset. If you were already at the bottom,
+# the view follows the new bottom instead (tail-follow). Changed lines carry a
+# marker in the right margin for about 6 seconds.
+#
+# Inline images: in a terminal with kitty graphics Unicode placeholders
+# (Ghostty, kitty), each standalone `![alt](path)` line becomes rows of
+# placeholder cells. Those rows are ordinary buffer lines, so an image scrolls,
+# clips at the pane edges and repaints like text. This script owns the tty side:
+# it transmits each image once per session, creates or resizes its virtual
+# placement, and deletes every image on quit. Elsewhere images stay as text.
+#
+# Usage:
+#   mdw FILE.md            view FILE.md
+#   mdw --split FILE.md    open mdw in a new Ghostty split to the right
+#   mdw --window FILE.md   open mdw in a new Ghostty window
+#   mdw FILE.md | less     piped output: plain render, no pager
+#
+# Keys: see `mdw --help`.
+
+MDW_VERSION=1.0.0
+MDW_SELF=${0:A}
+MDW_ROOT=${MDW_ROOT:-${MDW_SELF:h:h}}
+MDW_LIB="$MDW_ROOT/lib/mdw"
+MDW_STYLES="$MDW_ROOT/share/mdw/styles"
+
+usage() {
+  cat <<'EOF'
+mdw: live markdown viewer for the terminal
+
+Usage:
+  mdw FILE.md            view a file; it re-renders when the file changes
+  mdw --split FILE.md    open in a new Ghostty split to the right
+  mdw --window FILE.md   open in a new Ghostty window
+  mdw --version
+
+Keys:
+  j / k, arrows, wheel   scroll          space / b   page down / up
+  d / u                  half page       g / G       top / bottom
+  /                      search          n / N       next / previous match
+  t                      table of contents (type a number to jump)
+  l                      linked .md files (opens one in a split)
+  x                      check off a - [ ] task in the file
+  c                      copy a section as clean text
+  e                      edit in this pane     o   open in the GUI editor
+  r                      re-render now         q   quit
+
+Environment: MDW_THEME, MDW_IMAGES, MDW_MAX_COLS, MDW_COLS, MDW_MARGIN,
+MDW_SCROLL_STEP, MDW_EDITOR, MDW_GLOW_STYLE, MDW_LINK_ROOT (see README).
+EOF
+}
+
+# --- Ghostty launchers -------------------------------------------------------
+# Ghostty 1.3+ exposes an AppleScript dictionary, so a split or window can be
+# created directly with a command to run: no keystroke injection, no focus
+# games. The command runs mdw by absolute path with this shell's PATH and any
+# MDW_* settings, so glow and fswatch resolve the same way they do here.
+ghostty_open() {  # $1 = split|window, $2 = file
+  local mode=$1 file=${2:A}
+  if [[ $TERM_PROGRAM != ghostty ]] || ! command -v osascript >/dev/null 2>&1; then
+    local cmd="mdw ${(q)file}"
+    copy_to_clipboard "$cmd" && print -r -- "not running in Ghostty; copied to clipboard: $cmd" \
+      || print -r -- "not running in Ghostty; run: $cmd"
+    return 1
+  fi
+  local mytty
+  mytty=$( { tty </dev/tty ; } 2>/dev/null )
+  # Pass the exported environment's PATH and MDW_* settings, minus the
+  # appearance this instance resolved (the new one resolves its own).
+  local -a envs
+  local v
+  envs=( "PATH=$PATH" )
+  for v in ${(f)"$(env)"}; do
+    [[ $v == MDW_* && $v != MDW_APPEARANCE=* ]] && envs+=( "$v" )
+  done
+  osascript - "$mode" "$MDW_SELF" "$file" "${file:h}" "$mytty" "${envs[@]}" <<'APPLESCRIPT'
+on run argv
+  set mode to item 1 of argv
+  set mdwPath to item 2 of argv
+  set filePath to item 3 of argv
+  set workDir to item 4 of argv
+  set myTty to item 5 of argv
+  set envList to {}
+  if (count of argv) > 5 then set envList to items 6 thru -1 of argv
+  tell application "Ghostty"
+    set cfg to new surface configuration
+    set command of cfg to (quoted form of mdwPath) & " " & (quoted form of filePath)
+    set initial working directory of cfg to workDir
+    set environment variables of cfg to envList
+    if mode is "window" then
+      new window with configuration cfg
+      return "opened in a new window"
+    end if
+    set target to missing value
+    if myTty is not "" and myTty is not "not a tty" then
+      repeat with t in terminals
+        if tty of t is myTty then
+          set target to t
+          exit repeat
+        end if
+      end repeat
+    end if
+    if target is missing value then set target to focused terminal of selected tab of front window
+    split target direction right with configuration cfg
+    return "opened in a split"
+  end tell
+end run
+APPLESCRIPT
+}
+
+copy_to_clipboard() {
+  if command -v pbcopy >/dev/null 2>&1; then print -rn -- "$1" | pbcopy
+  elif command -v wl-copy >/dev/null 2>&1; then print -rn -- "$1" | wl-copy
+  elif command -v xclip >/dev/null 2>&1; then print -rn -- "$1" | xclip -selection clipboard
+  else return 1
+  fi
+}
+
+case $1 in
+  -h|--help) usage; exit 0 ;;
+  -V|--version) print -r -- "mdw $MDW_VERSION"; exit 0 ;;
+  --split|--window)
+    [[ -f $2 ]] || { print -r -- "no such file: $2" >&2; exit 1 }
+    ghostty_open "${1#--}" "$2"; exit $? ;;
+  '') usage >&2; exit 1 ;;
+esac
+
+setopt extendedglob
+
+f="$1"
+[[ -f $f ]] || { print -r -- "no such file: $f" >&2; exit 1 }
+f=${f:A}
+
+command -v glow >/dev/null 2>&1 || print -r -- "mdw: glow not found; install it for styled output (brew install glow)" >&2
+
+# Per-file scroll position memory: the offset is saved on quit and on scroll,
+# and restored on the next open of the same file.
+MDW_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/mdw"
+mkdir -p "$MDW_STATE_DIR" 2>/dev/null
+path_hash() {
+  if command -v md5 >/dev/null 2>&1; then md5 -q -s "$1"
+  elif command -v md5sum >/dev/null 2>&1; then print -rn -- "$1" | md5sum | cut -d' ' -f1
+  else python3 -c 'import hashlib,sys; print(hashlib.md5(sys.argv[1].encode()).hexdigest())' "$1"
+  fi
+}
+MDW_POSF="$MDW_STATE_DIR/$(path_hash "$f").off"
+
+# --- light or dark ------------------------------------------------------------
+# Decides which palette to paint. Order: MDW_THEME=dark|light, then a pinned
+# Ghostty theme (a name containing dawn, light or day reads as light), then the
+# macOS appearance (also what an auto light:/dark: Ghostty pair follows), then
+# dark. The result is exported so the renderer paints the same palette.
+mdw_appearance() {
+  case ${MDW_THEME:l} in
+    dark|light) print -r -- ${MDW_THEME:l}; return ;;
+  esac
+  if [[ $TERM_PROGRAM == ghostty ]]; then
+    local cfgdir=${XDG_CONFIG_HOME:-$HOME/.config}/ghostty line val
+    line=$(grep -h '^theme[[:space:]]*=' "$cfgdir/config" "$cfgdir/config.ghostty" \
+      "$HOME/Library/Application Support/com.mitchellh.ghostty/config" \
+      "$HOME/Library/Application Support/com.mitchellh.ghostty/config.ghostty" 2>/dev/null | tail -1)
+    val=${${line#*=}## }
+    if [[ -n $val && $val != *light:* && $val != *dark:* ]]; then
+      if [[ ${val:l} == *dawn* || ${val:l} == *light* || ${val:l} == *day* ]]; then
+        print light
+      else
+        print dark
+      fi
+      return
+    fi
+  fi
+  if [[ $OSTYPE == darwin* ]]; then
+    if [[ $(defaults read -g AppleInterfaceStyle 2>/dev/null) == Dark ]]; then print dark; else print light; fi
+    return
+  fi
+  print dark
+}
+
+# --- terminal title: the document title, not the shell command ---------------
+# Title = first ATX H1 in the file, else the filename with underscores turned
+# into spaces. mdw holds the alternate screen until quit, so an OSC 0 set here
+# survives the whole session. Reset in cleanup.
+doc_title() {
+  local line s t="" fence=0 n=0
+  while IFS= read -r line; do
+    (( ++n > 400 )) && break
+    if [[ $line == ('```'*|'~~~'*) ]]; then (( fence = ! fence )); continue; fi
+    (( fence )) && continue
+    s=${line##[[:space:]]#}
+    [[ $s == '#'[[:space:]]* ]] || continue
+    t=${s#\#}
+    break
+  done < "$f"
+  if [[ -n $t ]]; then
+    t=${t%%[[:space:]]#\##[[:space:]]#}                 # closing ### of an ATX heading
+    t=${t//(#b)\[([^\]]##)\]\(([^\)]##)\)/$match[1]}    # [text](url) -> text
+    t=${t//\`/}; t=${t//\*/}; t=${t//__/}               # emphasis markers
+    t=${t##[[:space:]]#}; t=${t%%[[:space:]]#}
+  fi
+  [[ -n $t ]] || t=${${f:t:r}//_/ }
+  print -r -- "$t"
+}
+
+set_term_title() {
+  [[ -t 1 ]] || return                                  # never into a pipe
+  printf '\033]0;%s\007' "$(doc_title)"
+}
+
+MDW_TMP="${TMPDIR:-/tmp}"
+MDW_TMP=${MDW_TMP%/}
+# Last reliably detected width. If detection misses, the real pane width is
+# reused instead of jumping to a wide default.
+MDW_WCACHE="$MDW_TMP/mdw_wcache.$$"
+# Rendered document buffer (whole doc, ANSI, folded to width).
+MDW_BUF="$MDW_TMP/mdw_buf.$$"
+# The background watcher cannot paint (the foreground shell owns the scroll
+# offset), so it only touches this flag; the foreground poll picks it up.
+MDW_DIRTY="$MDW_TMP/mdw_dirty.$$"
+# Image list the renderer writes on every render: id, cols, rows, png path.
+MDW_IMG_SIDE="$MDW_TMP/mdw_img.$$"
+
+# Width detection: stty size via the controlling tty, then $COLUMNS, then tput,
+# then the last cached width, then a narrow default. A miss can then only
+# under-fill the pane, never overflow it. tput is last because inside command
+# substitution its stdout is a pipe and it reports the terminfo default (80).
+term_cols() {
+  local c
+  c=$( { stty size </dev/tty ; } 2>/dev/null | awk '{print $2}' )
+  [[ $c == <-> && $c -gt 0 ]] || c=$COLUMNS
+  [[ $c == <-> && $c -gt 0 ]] || c=$( { tput cols </dev/tty ; } 2>/dev/null )
+  if [[ $c == <-> && $c -gt 0 ]]; then
+    print -r -- $c >| "$MDW_WCACHE" 2>/dev/null
+  else
+    [[ -r $MDW_WCACHE ]] && c=$(<"$MDW_WCACHE")
+    [[ $c == <-> && $c -gt 0 ]] || c=80
+  fi
+  print -r -- $c
+}
+
+term_rows() {
+  local r
+  r=$( { stty size </dev/tty ; } 2>/dev/null | awk '{print $1}' )
+  [[ $r == <-> && $r -gt 0 ]] || r=$LINES
+  [[ $r == <-> && $r -gt 0 ]] || r=24
+  print -r -- $r
+}
+
+# Wait for the pane size to stop moving before the first render. A new window
+# or split reports its final geometry a moment after the pty exists, so two
+# identical readings 40ms apart means the surface has settled. Gives up after
+# about 400ms and lets the resize poll finish the job.
+wait_for_stable_size() {
+  local a b i
+  a="$(term_cols)x$(term_rows)"
+  for i in {1..10}; do
+    sleep 0.04
+    b="$(term_cols)x$(term_rows)"
+    [[ $a == $b ]] && break
+    a=$b
+  done
+}
+
+# glow style for the current appearance. MDW_GLOW_STYLE overrides it.
+theme_style() {
+  if [[ -n $MDW_GLOW_STYLE ]]; then
+    print -r -- "$MDW_GLOW_STYLE"; return
+  fi
+  if [[ $MDW_APPEARANCE == dark ]]; then
+    print -r -- "$MDW_STYLES/rose-pine-moon.json"
+  else
+    print -r -- "$MDW_STYLES/rose-pine-dawn.json"
+  fi
+}
+
+content_width() {
+  local w cap margin
+  margin=${MDW_MARGIN:-0}
+  [[ $margin == <-> ]] || margin=0
+  if [[ -n $MDW_COLS && $MDW_COLS == <-> ]]; then
+    w=$MDW_COLS
+    (( w = w - margin ))
+  else
+    # $1 = a column count the caller already sampled, so the fold width and the
+    # resize baseline always come from the same reading (see rebuild).
+    w=${1:-$(term_cols)}
+    # Reserve 2 columns beyond any margin. A line that exactly fills the pane
+    # leaves the terminal in pending-wrap state, where paint()'s end-of-line
+    # erase lands on the last cell and eats that glyph. The spare column also
+    # holds the change and search markers.
+    (( w = w - margin - 2 ))
+    cap=${MDW_MAX_COLS:-110}
+    [[ $cap == <-> && $cap -gt 0 ]] || cap=110
+    (( w > cap )) && w=$cap
+  fi
+  (( w < 20 )) && w=20
+  print -r -- $w
+}
+
+# --- pager state (foreground shell only) ---
+typeset -gi offset=0 total=0 rows=24 page=22 pane_cols=80
+typeset -g  built_w="" c_dim="" c_chg="" c_hit="" c_hl="" c_num="" c_txt="" c_rst=$'\e[0m'
+typeset -ga buflines
+# ANSI-stripped copy of buflines; search matches against this.
+typeset -ga strip_lines
+typeset -g  search_term=""
+typeset -ga search_matches
+typeset -gi search_idx=0
+# Lines that contain (part of) a match, for on-screen highlighting.
+typeset -gA match_set
+# Changed-line markers after a live reload, cleared when SECONDS passes
+# chg_expire.
+typeset -gA chg_set
+typeset -gi chg_expire=0 last_saved_offset=-1
+# Inline images. MDW_IMAGES_ON is set only in the interactive branch, so piped
+# output never asks the renderer for placeholders. img_sent[id]=1 once the
+# pixels are in the terminal; img_place[id]="COLSxROWS" of its live placement.
+typeset -gi MDW_IMAGES_ON=0
+typeset -gA img_sent img_place
+
+# Images are on by default only where kitty Unicode placeholders are known to
+# work: Ghostty and kitty, outside tmux. MDW_IMAGES=1 forces them on, 0 off.
+images_supported() {
+  case $MDW_IMAGES in
+    0) return 1 ;;
+    1) return 0 ;;
+  esac
+  [[ -n $TMUX ]] && return 1
+  [[ $TERM_PROGRAM == ghostty || $TERM == xterm-ghostty || $TERM == xterm-kitty || -n $KITTY_WINDOW_ID ]]
+}
+
+# APC sequence that hands the terminal an image's pixels without placing it.
+# t=f passes the file path and the terminal reads the PNG itself, so a large
+# screenshot costs a hundred bytes on the tty; MDW_IMG_MEDIUM=d sends the bytes
+# inline in 4096-byte chunks instead (needed over ssh). q=2 silences the
+# terminal's reply, which would otherwise arrive on stdin as a fake keypress.
+img_transmit_seq() {  # $1 = id, $2 = png path
+  if [[ $MDW_IMG_MEDIUM == d ]]; then
+    python3 -c '
+import base64, sys
+data = base64.standard_b64encode(open(sys.argv[2], "rb").read()).decode()
+chunks = [data[i:i + 4096] for i in range(0, len(data), 4096)] or [""]
+out = []
+for k, c in enumerate(chunks):
+    more = 1 if k < len(chunks) - 1 else 0
+    head = ("a=t,f=100,t=d,i=%s,q=2,m=%d" % (sys.argv[1], more)) if k == 0 else ("m=%d" % more)
+    out.append("\x1b_G%s;%s\x1b\\" % (head, c))
+sys.stdout.write("".join(out))' "$1" "$2" 2>/dev/null
+  else
+    print -rn -- $'\e_Ga=t,f=100,t=f,i='"$1"$',q=2;'"$(print -rn -- "$2" | base64 | tr -d '\n')"$'\e\\'
+  fi
+}
+
+# Bring the terminal in line with the image list of the render just loaded:
+# transmit ids it has never seen, (re)place any whose size changed, and free ids
+# the document no longer shows (an edited image gets a new id). Placing always
+# deletes first: with no placement id in the cells, the terminal draws from the
+# first virtual placement of an image, so a stale one would keep winning.
+sync_images() {
+  (( MDW_IMAGES_ON )) || return 0
+  local id c r png seq=""
+  local -A seen
+  if [[ -s $MDW_IMG_SIDE ]]; then
+    while IFS=$'\t' read -r id c r png; do
+      [[ $id == <-> && $c == <-> && $r == <-> && -n $png ]] || continue
+      seen[$id]=1
+      if [[ -z ${img_sent[$id]} ]]; then
+        seq+=$(img_transmit_seq "$id" "$png")
+        img_sent[$id]=1
+      fi
+      if [[ ${img_place[$id]} != "${c}x${r}" ]]; then
+        [[ -n ${img_place[$id]} ]] && seq+=$'\e_Ga=d,d=i,i='"$id"$',q=2\e\\'
+        seq+=$'\e_Ga=p,U=1,i='"$id"',p=1,c='"$c"',r='"$r"$',q=2\e\\'
+        img_place[$id]="${c}x${r}"
+      fi
+    done < "$MDW_IMG_SIDE"
+  fi
+  for id in ${(k)img_sent}; do
+    [[ -n ${seen[$id]} ]] && continue
+    seq+=$'\e_Ga=d,d=I,i='"$id"$',q=2\e\\'
+    unset "img_sent[$id]" "img_place[$id]"
+  done
+  [[ -n $seq ]] && print -rn -- "$seq"
+}
+
+# Free every image this session sent (uppercase I = placements and pixels).
+# Runs on quit, and before `r` re-sends everything.
+img_forget_all() {
+  local id seq=""
+  for id in ${(k)img_sent}; do
+    seq+=$'\e_Ga=d,d=I,i='"$id"$',q=2\e\\'
+  done
+  img_sent=(); img_place=()
+  [[ -n $seq ]] && print -rn -- "$seq"
+}
+
+save_pos() {
+  (( offset == last_saved_offset )) && return
+  print -r -- $offset >| "$MDW_POSF" 2>/dev/null
+  last_saved_offset=$offset
+}
+
+# Re-render the whole doc into the buffer at the current width, then load it
+# into an in-memory array so paint() never spawns a subprocess. Every reload
+# path (file change, resize, edit, refresh) comes through here, so the cached
+# sizes and colours can never go stale across an event.
+rebuild() {
+  local w style
+  # One reading of the pane, taken before the render, feeds both the fold width
+  # and the resize baseline. Reading it again after the render would swallow a
+  # resize that landed while the render was running: the buffer would stay
+  # folded at the old width while pane_cols already held the new one, and the
+  # poll would never see a difference.
+  pane_cols=$(term_cols)
+  rows=$(term_rows)
+  w=$(content_width $pane_cols)
+  export MDW_APPEARANCE=$(mdw_appearance)
+  style=$(theme_style)
+  mdw_built_style=$style
+  local -a imgargs
+  (( MDW_IMAGES_ON )) && imgargs=( --images --pane-rows "$rows" --images-out "$MDW_IMG_SIDE" )
+  python3 "$MDW_LIB/render.py" --columns "$w" --style "$style" "${imgargs[@]}" "$f" >| "$MDW_BUF.new" 2>/dev/null \
+    || cat "$f" >| "$MDW_BUF.new"
+  mv -f "$MDW_BUF.new" "$MDW_BUF"
+  buflines=( "${(@f)$(<"$MDW_BUF")}" )
+  total=${#buflines}
+  local _l
+  strip_lines=()
+  for _l in "${buflines[@]}"; do
+    strip_lines+=( "${_l//$'\e'\[[0-9;]#m/}" )
+  done
+  built_w=$w
+  sync_images
+  # Chrome colours for the footer, markers and menus, per appearance.
+  if [[ $MDW_APPEARANCE == dark ]]; then
+    c_dim=$'\e[38;2;144;140;170m'      # Rose Pine subtle  #908caa
+    c_chg=$'\e[38;2;235;188;186m'      # Rose Pine rose    #ebbcba
+    c_hit=$'\e[38;2;246;193;119m'      # Rose Pine gold    #f6c177
+    c_hl=$'\e[48;2;64;61;82m'          # Rose Pine highlightMed #403d52
+    c_num=$'\e[38;2;156;207;216m'      # Rose Pine foam    #9ccfd8
+    c_txt=$'\e[38;2;224;222;244m'      # Rose Pine text    #e0def4
+  else
+    c_dim=$'\e[38;2;121;117;147m'      # Dawn subtle       #797593
+    c_chg=$'\e[38;2;215;130;126m'      # Dawn rose         #d7827e
+    c_hit=$'\e[38;2;183;131;76m'       # Dawn bronze       #b7834c
+    c_hl=$'\e[48;2;223;218;217m'       # Dawn highlightMed #dfdad9
+    c_num=$'\e[38;2;86;148;159m'       # Dawn foam         #56949f
+    c_txt=$'\e[38;2;87;82;121m'        # Dawn text         #575279
+  fi
+}
+
+max_offset() {
+  local m=$(( total - page ))
+  (( m < 0 )) && m=0
+  print -r -- $m
+}
+
+# Paint the current window: clamp the offset, slice page lines from the
+# in-memory buffer, and pin a footer at the bottom (a thin rule, then filename
+# left and percent plus key hints right). The frame is composed into one string
+# and written in a single print, inside synchronized output, so repaints do not
+# flicker. The footer truncates responsively: hints drop first, then the
+# filename shortens, so it never wraps into the content.
+paint() {
+  page=$(( rows - 2 ))
+  (( page < 1 )) && page=1
+  local m=$(max_offset)
+  (( offset > m )) && offset=m
+  (( offset < 0 )) && offset=0
+  local pct=100
+  (( total > 0 )) && pct=$(( (offset + page) * 100 / total ))
+  (( pct > 100 )) && pct=100
+
+  local esc=$'\e'
+  local out=$'\e[?2026h\e[H\e[0m' ln
+  local -i li=$offset marks_live=0
+  (( chg_expire > SECONDS )) && marks_live=1
+  # The current search match gets a background wash instead of reverse video,
+  # which would inherit the terminal's selection colour.
+  local -i cur_line=0
+  local s low pre q
+  if [[ -n $search_term ]] && (( ${#search_matches} && search_idx >= 1 )); then
+    cur_line=${search_matches[search_idx]}
+    q=${search_term:l}
+  fi
+  for ln in "${(@)buflines[offset+1, offset+page]}"; do
+    (( li++ ))
+    if (( li == cur_line )); then
+      # Repaint this one line from the ANSI-stripped text so the match can be
+      # wrapped in the wash; losing the line's colours marks it as the current
+      # hit, the way less renders the current match.
+      s=${strip_lines[li]}; low=${strip_lines[li]:l}
+      pre=${low%%"$q"*}
+      if (( ${#pre} < ${#low} )); then
+        out+="${s[1,${#pre}]}${c_hl}${s[$(( ${#pre} + 1 )),$(( ${#pre} + ${#q} ))]}${c_rst}${s[$(( ${#pre} + ${#q} + 1 )),-1]}"$'\e[0m\e[K'
+      else
+        out+="$ln"$'\e[0m\e[K'
+      fi
+    else
+      out+="$ln"$'\e[0m\e[K'
+    fi
+    if (( marks_live )) && [[ -n ${chg_set[$li]} ]]; then
+      out+="${esc}[${pane_cols}G${c_chg}▎${c_rst}"
+    fi
+    if [[ -n $search_term && -n ${match_set[$li]} ]]; then
+      # drawn after the change marker so a line that is both shows the search tick
+      out+="${esc}[${pane_cols}G${c_hit}▎${c_rst}"
+    fi
+    out+=$'\n'
+  done
+  out+=$'\e[0m\e[J'
+
+  local rule="${(l:$pane_cols::─:):-}"
+  local left=" ${f:t}"
+  if [[ -n $search_term ]]; then
+    left=" ${f:t} · /${search_term} (${search_idx}/${#search_matches})"
+  fi
+  local hint="/ find · t toc · l links · x check · c copy · e edit · q quit"
+  local right="${pct}% · ${hint} "
+  (( ${#left} + ${#right} + 2 > pane_cols )) && right="${pct}% "
+  if (( ${#left} + ${#right} + 2 > pane_cols )); then
+    local keep=$(( pane_cols - ${#right} - 3 ))
+    (( keep < 4 )) && keep=4
+    left=" ${${f:t}[1,$keep]}…"
+  fi
+  local gap=$(( pane_cols - ${#left} - ${#right} ))
+  (( gap < 1 )) && gap=1
+
+  out+="${esc}[$(( rows - 1 ));1H${c_dim}${rule}${esc}[K"
+  out+="${esc}[${rows};1H${c_dim}${left}${(l:$gap:: :):-}${right}${c_rst}${esc}[K"
+  out+="${esc}[?2026l"
+  print -rn -- $out
+}
+
+# Trackpad and wheel scrolling arrive as a burst of arrow-key sequences. After
+# the first scroll key this drains everything already buffered on stdin
+# (-t 0 never blocks) and folds consecutive scroll keys into one delta for a
+# single repaint. A non-scroll key ends the drain and is carried back to the
+# main loop in PENDING_KEY, so nothing typed mid-scroll is lost.
+typeset -gi COAL_D=0
+typeset -g  PENDING_KEY=""
+# Lines per wheel/j/k tick. Fractions accumulate, so 1.5 moves an extra line
+# every other tick.
+typeset -F MDW_SCROLL_STEP=${MDW_SCROLL_STEP:-1.5}
+typeset -F MDW_SCROLL_ACC=0
+(( MDW_SCROLL_STEP > 0 )) || MDW_SCROLL_STEP=1.5
+apply_scroll() {
+  local ticks=$1
+  typeset -i lines
+  MDW_SCROLL_ACC=$(( MDW_SCROLL_ACC + ticks * MDW_SCROLL_STEP ))
+  (( lines = MDW_SCROLL_ACC ))
+  (( offset += lines ))
+  MDW_SCROLL_ACC=$(( MDW_SCROLL_ACC - lines ))
+}
+coalesce_scroll() {
+  COAL_D=0; PENDING_KEY=""
+  local k s c
+  # Drain only what is already buffered. A settle window that waits for ticks
+  # to stop makes the view snap: momentum never pauses mid-swipe.
+  while IFS= read -rsk1 -t 0 k 2>/dev/null; do
+    if [[ $k == $'\e' ]]; then
+      s=""
+      while IFS= read -rsk1 -t 0.003 c 2>/dev/null; do
+        s+=$c
+        [[ $c == [A-Za-z~] ]] && break
+        (( ${#s} >= 6 )) && break
+      done
+      k=$'\e'$s
+    fi
+    case $k in
+      j|$'\e[B') (( COAL_D += 1 )) ;;
+      k|$'\e[A') (( COAL_D -= 1 )) ;;
+      *) PENDING_KEY=$k; break ;;
+    esac
+  done
+}
+
+# Re-render because the file changed: hold the scroll offset, and tail-follow
+# only if the view was already at the bottom. Lines that changed get a margin
+# marker for about 6 seconds (diff of the old and new rendered buffers).
+reload_file() {
+  local was_bottom=0 old_w=$built_w
+  # Sync the mtime baseline so a reload from any path does not double-fire on
+  # the next timeout wake.
+  (( $+functions[_mdw_mtime] )) && mdw_last_mtime=$(_mdw_mtime)
+  (( offset >= $(max_offset) )) && was_bottom=1
+  [[ -f $MDW_BUF ]] && cp -f "$MDW_BUF" "$MDW_BUF.prev" 2>/dev/null
+  rebuild
+  set_term_title            # the H1 can change while the file is edited
+  chg_set=(); chg_expire=0
+  if [[ -f $MDW_BUF.prev && $built_w == $old_w ]]; then
+    local -a marks
+    marks=( $(python3 "$MDW_LIB/diff_lines.py" "$MDW_BUF.prev" "$MDW_BUF" 2>/dev/null) )
+    # a whole-doc rewrite marks everything, which is noise
+    if (( ${#marks} > 0 && ${#marks} <= 400 )); then
+      local m
+      for m in "${marks[@]}"; do chg_set[$m]=1; done
+      chg_expire=$(( SECONDS + 6 ))
+    fi
+  fi
+  # Line numbers may have shifted: refresh the match map.
+  if [[ -n $search_term ]]; then
+    find_matches
+    (( search_idx > ${#search_matches} )) && search_idx=${#search_matches}
+  fi
+  (( was_bottom )) && offset=$(max_offset)
+  paint
+}
+
+# Re-render because the pane changed size: rebuild at the new width and map the
+# old offset to the same relative position in the new fold.
+reload_resize() {
+  local old_total=$total old_offset=$offset
+  rebuild
+  chg_set=(); chg_expire=0     # fold indices shifted; markers would lie
+  if (( old_total > 0 )); then
+    offset=$(( old_offset * total / old_total ))
+  fi
+  if [[ -n $search_term ]]; then
+    find_matches
+    (( search_idx > ${#search_matches} )) && search_idx=${#search_matches}
+  fi
+  paint
+}
+
+# Shared menu for t, c, x and l: show a title and a prebuilt menu, then read a
+# number. The alternate screen has no scrollback, so a menu taller than the pane
+# goes through less first (q closes it). The key read times out every 0.5s so
+# an open menu never starves the file watcher. Sets MENU_SEL to the chosen
+# number, or empty on cancel.
+typeset -g MENU_SEL=""
+menu_pick() {  # $1 = title, $2 = menu text, $3 = menu line count, $4 = count, $5 = prompt
+  local title=$1 menu=$2 lines=$3 count=$4 prompt=$5 first ch sel=""
+  local c_bold=$'\e[1m'
+  printf '\e[H\e[2J\e[0m'
+  if (( lines + 3 > $(term_rows) )); then
+    { print -r -- "$title"; print -rn -- "$menu" } | less -R </dev/tty >/dev/tty
+    # less leaves the alternate screen on exit; step back onto it (it keeps its
+    # images, since erasing the display never deletes virtual placements).
+    printf '\e[?1049h\e[H\e[2J\e[0m'
+    print -r -- "$title"
+  else
+    print -r -- "$title"
+    print -rn -- "$menu"
+  fi
+  print -n -- $'\n'"${c_dim} ${prompt} (q cancels): ${c_rst}"
+  while true; do
+    IFS= read -rsk1 -t 0.5 first </dev/tty 2>/dev/null && break
+    mdw_ensure_watchers
+  done
+  if [[ $first == [0-9] ]]; then
+    sel=$first; print -rn -- "${c_num}${c_bold}${first}${c_rst}"
+    while (( ${#sel} < ${#count} )); do
+      IFS= read -rsk1 -t 0.6 ch </dev/tty 2>/dev/null || break
+      [[ $ch == [0-9] ]] || break
+      sel+=$ch; print -rn -- "${c_num}${c_bold}${ch}${c_rst}"
+    done
+  fi
+  MENU_SEL=""
+  [[ $sel == <-> ]] && (( sel >= 1 && sel <= count )) && MENU_SEL=$sel
+}
+
+# Table of contents (t). The heading map comes from the buffer being displayed,
+# matched against the source headings, so line numbers line up exactly.
+toc_jump() {
+  local count=0 i
+  local -a levels lines texts
+  local _n lv ln _sl tx
+  while IFS=$'\t' read -r _n lv ln _sl tx; do
+    [[ $lv == <-> && $ln == <-> ]] || continue
+    (( ln > 0 )) || continue
+    (( count++ )); levels[count]=$lv; lines[count]=$ln; texts[count]=$tx
+  done < <(python3 "$MDW_LIB/sections.py" rendermap "$f" "$MDW_BUF" 2>/dev/null)
+  (( count == 0 )) && { paint; return }
+
+  local c_bold=$'\e[1m' w=$(content_width) maxw=${#count} menu="" indent avail label
+  for i in {1..$count}; do
+    indent=""; repeat $(( levels[i] - 1 )) indent+="  "
+    label=${texts[i]}
+    avail=$(( w - maxw - 3 - ${#indent} ))
+    (( avail < 8 )) && avail=8
+    (( ${#label} > avail )) && label="${label[1,$((avail-1))]}…"
+    menu+=$(printf '%s%*d%s  %s%s%s' "$c_num$c_bold" $maxw $i "$c_rst" "$indent" "$c_txt$label" "$c_rst")
+    menu+=$'\n'
+  done
+  menu_pick "${c_bold}${c_num}Table of contents${c_rst} ${c_dim}(${count} sections). Type a number, q cancels.${c_rst}" \
+    "$menu" $count $count "Jump to #"
+  [[ -n $MENU_SEL ]] && offset=$(( lines[MENU_SEL] - 1 ))
+  paint
+}
+
+# Edit the file in this pane with a terminal editor, then return to the view.
+# MDW_EDITOR wins; then $VISUAL or $EDITOR unless it is a GUI `open ...`
+# command (which returns immediately and would leave a blank pager); then
+# micro, nano, vi. The pager hands the tty over fully and reclaims it after.
+edit_in_pane() {
+  local -a ed
+  local cand=${MDW_EDITOR:-${VISUAL:-$EDITOR}}
+  if [[ -n $cand && $cand != open* ]]; then
+    ed=( ${(z)cand} )
+  elif command -v micro >/dev/null 2>&1; then
+    ed=( micro )
+  elif command -v nano >/dev/null 2>&1; then
+    ed=( nano )
+  else
+    ed=( vi )
+  fi
+  # Drain queued input (scroll momentum, half-delivered mouse reports) before
+  # and after the handoff, or a leftover report gets typed into the editor.
+  local _junk
+  while IFS= read -rsk1 -t 0 _junk 2>/dev/null; do :; done
+  printf '\e[?2026l\e[?1000l\e[?1002l\e[?1003l\e[?1006l\e[?2004l\e[?1007l\e[?25h\e[?1049l'
+  [[ -n $MDW_STTY ]] && stty "$MDW_STTY" </dev/tty 2>/dev/null
+  # Ctrl+C is the pager's refresh key; ignore it while the editor runs.
+  setopt localoptions localtraps
+  trap '' INT
+  # Open the editor at the section you are reading: the first heading visible
+  # in the upper half of the screen, else the section containing the top line.
+  local srcline
+  srcline=$(python3 "$MDW_LIB/sections.py" rendermap "$f" "$MDW_BUF" 2>/dev/null \
+    | awk -F'\t' -v top=$(( offset + 1 )) -v lim=$(( offset + page / 2 + 1 )) '
+        $3 > 0 && $3 <= top {s=$4}
+        $3 > top && $3 <= lim && !v {v=$4}
+        END {print (v ? v : s) + 0}')
+  [[ $srcline == <-> && $srcline -gt 0 ]] || srcline=""
+  # Open by basename from the file's directory so editor prompts that embed the
+  # path stay short.
+  local -a edcmd=( "${ed[@]}" )
+  case ${ed[1]:t} in
+    micro) edcmd+=( "${f:t}" ); [[ -n $srcline ]] && edcmd+=( "+$srcline" ) ;;
+    nano|vim|nvim|vi|hx|kak) [[ -n $srcline ]] && edcmd+=( "+$srcline" ); edcmd+=( "${f:t}" ) ;;
+    *) edcmd+=( "${f:t}" ) ;;
+  esac
+  ( cd "${f:h}" && "${edcmd[@]}" ) </dev/tty >/dev/tty
+  # Restore the pager tty. Echo off alone looks like a password prompt to some
+  # terminals (Ghostty shows a secure-input lock), so -icanon goes with it.
+  stty -echo -icanon min 1 time 0 </dev/tty 2>/dev/null
+  while IFS= read -rsk1 -t 0 _junk 2>/dev/null; do :; done
+  printf '\e[?1000l\e[?1002l\e[?1003l\e[?1006l\e[?2004l\e[?2026l\e[?1049h\e[?25l\e[?1007h'
+  rm -f "$MDW_DIRTY"          # the edit itself triggered the watcher
+  reload_file
+}
+
+# Open the file in a GUI editor and keep viewing; saves there live-reload the
+# view. MDW_GUI_EDITOR, else $EDITOR when it is an `open ...` command, else
+# the system default handler.
+open_in_gui() {
+  if [[ -n $MDW_GUI_EDITOR ]]; then
+    ${(z)MDW_GUI_EDITOR} "$f" >/dev/null 2>&1 &!
+  elif [[ $EDITOR == open* ]]; then
+    ${(z)EDITOR} "$f" >/dev/null 2>&1
+  elif command -v open >/dev/null 2>&1; then
+    open "$f" >/dev/null 2>&1
+  else
+    xdg-open "$f" >/dev/null 2>&1 &!
+  fi
+}
+
+# Search (/): type a term on the footer line, Enter jumps to the first match at
+# or below the top of the screen, n / N cycle, Esc cancels or clears. Matching
+# is case-insensitive against the ANSI-stripped buffer.
+find_matches() {
+  local i q="${search_term:l}" a b
+  local phrase=0
+  [[ $q == *' '* ]] && phrase=1
+  search_matches=()
+  match_set=()
+  for (( i = 1; i <= total; i++ )); do
+    a=${strip_lines[i]:l}
+    if [[ $a == *"$q"* ]]; then
+      search_matches+=( $i ); match_set[$i]=1
+      continue
+    fi
+    # A multi-word phrase can be split across the fold: try this line joined
+    # with the next, quote gutters dropped and space runs squeezed.
+    if (( phrase && i < total )); then
+      b="$a ${strip_lines[i+1]:l}"
+      b=${b//│/ }
+      while [[ $b == *'  '* ]]; do b=${b//  / }; done
+      if [[ $b == *"$q"* ]]; then
+        search_matches+=( $i ); match_set[$i]=1; match_set[$(( i + 1 ))]=1
+      fi
+    fi
+  done
+}
+
+jump_match() {  # $1 = ordinal in search_matches
+  (( ${#search_matches} == 0 )) && { paint; return }
+  (( $1 < 1 )) && set -- ${#search_matches}
+  (( $1 > ${#search_matches} )) && set -- 1
+  search_idx=$1
+  offset=$(( search_matches[search_idx] - 1 ))
+  paint
+}
+
+do_search() {
+  local q="" ch esc=$'\e'
+  _mdw_draw_search() {
+    printf '%s[%d;1H%s[K%s /%s%s' "$esc" "$rows" "$esc" "$c_dim" "$c_rst" "$q"
+  }
+  _mdw_draw_search
+  # The key read times out so an open prompt never freezes live reload.
+  while true; do
+    if IFS= read -rsk1 -t 0.5 ch 2>/dev/null; then
+      case $ch in
+        $'\r'|$'\n') break ;;
+        $'\e') paint; return ;;
+        $'\x7f'|$'\b')
+          [[ -n $q ]] && { q=${q[1,-2]}; _mdw_draw_search } ;;
+        *)
+          [[ $ch == [[:print:]] ]] || continue
+          q+=$ch; printf '%s' "$ch" ;;
+      esac
+    else
+      mdw_poll_idle && _mdw_draw_search
+    fi
+  done
+  [[ -z $q ]] && { paint; return }
+  search_term=$q
+  find_matches
+  local i target=1
+  for (( i = 1; i <= ${#search_matches}; i++ )); do
+    if (( search_matches[i] > offset )); then target=$i; break; fi
+  done
+  jump_match $target
+}
+
+# Copy a section as clean text (c). Terminal selection copies the painted
+# screen, gutters and wrap breaks included. This copies the section's source
+# instead: heading dropped, quote prefixes and ** markers removed.
+copy_section() {
+  local count=0 i
+  local -a levels titles
+  local _n lv _sl tx
+  while IFS=$'\t' read -r _n lv _sl tx; do
+    (( count++ )); levels[count]=$lv; titles[count]=$tx
+  done < <(python3 "$MDW_LIB/sections.py" list "$f" 2>/dev/null)
+  (( count == 0 )) && { paint; return }
+  local c_bold=$'\e[1m' maxw=${#count} menu="" indent
+  for i in {1..$count}; do
+    indent=""; repeat $(( levels[i] - 1 )) indent+="  "
+    menu+=$(printf '%s%*d%s  %s%s%s' "$c_num$c_bold" $maxw $i "$c_rst" "$indent" "$c_txt${titles[i][1,70]}" "$c_rst")
+    menu+=$'\n'
+  done
+  menu_pick "${c_bold}${c_num}Copy section as clean text${c_rst} ${c_dim}(${count} sections). Type a number, q cancels.${c_rst}" \
+    "$menu" $count $count "Copy #"
+  [[ -n $MENU_SEL ]] && python3 "$MDW_LIB/sections.py" copy "$f" "$MENU_SEL" >/dev/null 2>&1
+  paint
+}
+
+# Check off a task (x). Lists every "- [ ]" / "- [x]" line in the source; a
+# number flips that box in the file itself. The write comes back through the
+# normal reload, so the view holds position and the line gets a change marker.
+check_item() {
+  local count=0 i
+  local -a states labels
+  local _n st tx
+  while IFS=$'\t' read -r _n st tx; do
+    (( count++ )); states[count]=$st; labels[count]=$tx
+  done < <(python3 "$MDW_LIB/checkbox.py" list "$f" 2>/dev/null)
+  (( count == 0 )) && { paint; return }
+  local c_bold=$'\e[1m' w=$(content_width) maxw=${#count} menu="" lab avail
+  avail=$(( w - maxw - 6 ))
+  (( avail < 8 )) && avail=8
+  for i in {1..$count}; do
+    lab=${labels[i]}
+    (( ${#lab} > avail )) && lab="${lab[1,$((avail-1))]}…"
+    if [[ ${states[i]} == x ]]; then
+      menu+=$(printf '%s%*d  ✓ %s%s' "$c_dim" $maxw $i "$lab" "$c_rst")
+    else
+      menu+=$(printf '%s%*d%s  ☐ %s%s%s' "$c_num$c_bold" $maxw $i "$c_rst" "$c_txt" "$lab" "$c_rst")
+    fi
+    menu+=$'\n'
+  done
+  menu_pick "${c_bold}${c_num}Check off${c_rst} ${c_dim}(${count} items). Type a number to flip it, q cancels.${c_rst}" \
+    "$menu" $count $count "Flip #"
+  if [[ -n $MENU_SEL ]]; then
+    python3 "$MDW_LIB/checkbox.py" toggle "$f" "$MENU_SEL" >/dev/null 2>&1
+    rm -f "$MDW_DIRTY"
+    reload_file
+    return
+  fi
+  paint
+}
+
+# Open a linked doc (l). Lists the local .md files this doc references
+# (markdown links, `path.md` code spans, bare paths), resolved against the
+# doc's folder and its ancestors, plus MDW_LINK_ROOT when set. A number opens
+# that file in a new Ghostty split to the right.
+open_link() {
+  local count=0 missing=0 i
+  local -a paths labels
+  local _n st p lab
+  printf '\e[H\e[2J\e[0m finding links...'
+  while IFS=$'\t' read -r _n st p lab; do
+    if [[ $st == ok ]]; then
+      (( count++ )); paths[count]=$p; labels[count]=$lab
+    else
+      (( missing++ ))
+    fi
+  done < <(python3 "$MDW_LIB/links.py" list "$f" 2>/dev/null)
+  if (( count == 0 )); then
+    printf '\e[H\e[2J\e[0m'
+    local why=""
+    (( missing > 0 )) && why=" ($missing could not be resolved)"
+    print -r -- "${c_dim} No local .md links found in this doc${why}.${c_rst}"
+    sleep 1.2; paint; return
+  fi
+  local c_bold=$'\e[1m' w=$(content_width) maxw=${#count} menu="" name dir avail
+  avail=$(( w - maxw - 4 ))
+  (( avail < 12 )) && avail=12
+  for i in {1..$count}; do
+    name=${paths[i]:t:r}
+    dir=${paths[i]:h}
+    [[ -n $MDW_LINK_ROOT ]] && dir=${dir#${MDW_LINK_ROOT%/}/}
+    dir=${dir/#$HOME/~}
+    (( ${#name} > avail )) && name="${name[1,$((avail-1))]}…"
+    menu+=$(printf '%s%*d%s  %s%s%s' "$c_num$c_bold" $maxw $i "$c_rst" "$c_txt" "$name" "$c_rst")
+    menu+=$'\n'
+    (( ${#dir} > avail )) && dir="…${dir[-$((avail-1)),-1]}"
+    menu+=$(printf '%*s  %s%s%s' $maxw "" "$c_dim" "$dir" "$c_rst")
+    menu+=$'\n'
+  done
+  local extra=""
+  (( missing > 0 )) && extra=", $missing not found"
+  menu_pick "${c_bold}${c_num}Open in a split to the right${c_rst} ${c_dim}(${count} linked docs${extra}). Type a number, q cancels.${c_rst}" \
+    "$menu" $(( count * 2 )) $count "Open #"
+  if [[ -n $MENU_SEL ]]; then
+    local msg
+    msg=$(ghostty_open split "${paths[MENU_SEL]}" 2>&1 | tail -n 1)
+    print -rn -- $'\n\n'"${c_dim} ${msg}${c_rst}"
+    sleep 1.5
+  fi
+  paint
+}
+
+# Ctrl+C forces a re-render, holding position (same as r).
+TRAPINT()  { reload_file; return 0 }
+# WINCH must not do real work: traps are inherited by $(...) subshells, so a
+# resize landing inside term_cols() would run a repaint in the subshell and its
+# output would be captured as the width. The signal only interrupts the blocking
+# read; the 0.5s poll sees the new size and reloads from the foreground shell.
+TRAPWINCH() { : }
+
+# File watching. fswatch (when installed) marks the buffer dirty on every
+# change; it runs on its own through a fifo so FSPID is its real pid. The 0.5s
+# poll below also compares the file's mtime, so without fswatch, or if it dies,
+# reload degrades to half-second polling instead of a frozen view.
+MDW_FIFO="$MDW_TMP/mdw_fifo.$$"
+typeset -g FSPID="" LOOPPID=""
+MDW_HAVE_FSWATCH=0
+command -v fswatch >/dev/null 2>&1 && MDW_HAVE_FSWATCH=1
+
+mdw_start_watchers() {
+  (( MDW_HAVE_FSWATCH )) || return 0
+  rm -f "$MDW_FIFO"
+  mkfifo "$MDW_FIFO" 2>/dev/null
+  fswatch -o "$f" >| "$MDW_FIFO" &
+  FSPID=$!
+  while read -r _; do : >| "$MDW_DIRTY"; done < "$MDW_FIFO" &
+  LOOPPID=$!
+}
+
+# Restart fswatch and its reader if either exited (an atomic replace of the file
+# can make fswatch drop the old inode and exit). Cheap when both are alive.
+mdw_ensure_watchers() {
+  (( MDW_HAVE_FSWATCH )) || return 0
+  kill -0 $FSPID 2>/dev/null && kill -0 $LOOPPID 2>/dev/null && return 0
+  kill $FSPID $LOOPPID 2>/dev/null
+  mdw_start_watchers
+}
+
+zmodload -F zsh/stat b:zstat 2>/dev/null
+_mdw_mtime() { zstat +mtime "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null }
+mdw_last_mtime=$(_mdw_mtime)
+mdw_appearance_next=0
+
+# Shared timeout work for the key loop and the search prompt: restart a dead
+# watcher, reload on a dirty flag or mtime change, follow an appearance flip,
+# and handle resize. Returns 0 if the view was repainted.
+mdw_poll_idle() {
+  local cur_mtime cur_w cur_r painted=1
+  mdw_ensure_watchers
+  cur_mtime=$(_mdw_mtime)
+  if [[ -e $MDW_DIRTY || ( -n $cur_mtime && $cur_mtime != $mdw_last_mtime ) ]]; then
+    rm -f "$MDW_DIRTY"
+    mdw_last_mtime=$cur_mtime
+    reload_file
+    painted=0
+  fi
+  if (( chg_expire && SECONDS >= chg_expire )); then
+    chg_expire=0; chg_set=()
+    paint
+    painted=0
+  fi
+  # The system can switch between light and dark while the view sits idle;
+  # check every 5 seconds and re-render in the matching palette.
+  if (( SECONDS >= mdw_appearance_next )); then
+    mdw_appearance_next=$(( SECONDS + 5 ))
+    if [[ $(mdw_appearance) != $MDW_APPEARANCE ]]; then
+      reload_file
+      painted=0
+    fi
+  fi
+  save_pos
+  cur_w=$(term_cols); cur_r=$(term_rows)
+  if [[ $cur_w != $mdw_last_w || $cur_r != $mdw_last_r ]]; then
+    reload_resize
+    mdw_last_w=$cur_w
+    mdw_last_r=$cur_r
+    painted=0
+  fi
+  return $painted
+}
+
+cleanup() {
+  [[ -n $FSPID ]] && kill $FSPID $LOOPPID 2>/dev/null
+  if (( MDW_INTERACTIVE )); then
+    save_pos
+    # Leave the alternate screen, restore the cursor, wheel mode and tty echo.
+    # The empty OSC 0 hands the tab title back to the shell.
+    printf '\033]0;\007'
+    img_forget_all
+    printf '\e[?2026l\e[?1007l\e[?25h\e[?1049l'
+    [[ -n $MDW_STTY ]] && stty "$MDW_STTY" </dev/tty 2>/dev/null
+  fi
+  rm -f "$MDW_WCACHE" "$MDW_FIFO" "$MDW_DIRTY" "$MDW_BUF" "$MDW_BUF.new" \
+        "$MDW_BUF.prev" "$MDW_IMG_SIDE" 2>/dev/null
+}
+# EXIT covers normal exit and q; TERM and HUP cover a force-closed pane so
+# fswatch is reaped there too. INT is not trapped here: Ctrl+C is refresh.
+trap 'cleanup; exit' TERM HUP
+trap cleanup EXIT
+
+typeset -gi MDW_INTERACTIVE=0
+
+if [[ -t 0 && -t 1 ]]; then
+  MDW_INTERACTIVE=1
+  mdw_start_watchers
+  # Alternate screen, hidden cursor, alternate-scroll mode (the wheel arrives as
+  # arrow keys). Echo is off for the whole session, or scroll events arriving
+  # during a paint get echoed as stray "[A[B" text. -icanon rides along: echo
+  # off alone in a line-buffered tty looks like a password prompt.
+  images_supported && MDW_IMAGES_ON=1
+  typeset -g MDW_STTY=$(stty -g </dev/tty 2>/dev/null)
+  stty -echo -icanon min 1 time 0 </dev/tty 2>/dev/null
+  printf '\e[?1049h\e[?25l\e[?1007h'
+  wait_for_stable_size
+  rebuild
+  set_term_title
+  # Restore the last reading spot for this file (paint clamps it).
+  if [[ -f $MDW_POSF ]]; then
+    _saved=$(<"$MDW_POSF")
+    [[ $_saved == <-> ]] && offset=$_saved
+  fi
+  paint
+
+  # The key read times out so the loop wakes about twice a second with no
+  # keypress, to pick up file changes and resizes. Polling is the reliable
+  # resize path: zsh does not run TRAPWINCH while blocked in `read -k`.
+  mdw_last_w=$pane_cols
+  mdw_last_r=$rows
+  key=""
+  while true; do
+    if [[ -n $PENDING_KEY ]]; then
+      key=$PENDING_KEY; PENDING_KEY=""
+    elif IFS= read -rsk1 -t 0.5 key 2>/dev/null; then
+      if [[ $key == $'\e' ]]; then
+        # Collect the rest of the escape sequence (arrows, PgUp/PgDn, Home/End).
+        seq=""
+        while IFS= read -rsk1 -t 0.005 c 2>/dev/null; do
+          seq+=$c
+          [[ $c == [A-Za-z~] ]] && break
+          (( ${#seq} >= 6 )) && break
+        done
+        key=$'\e'$seq
+      fi
+    else
+      mdw_poll_idle
+      continue
+    fi
+    case $key in
+      q|Q) break ;;
+      t|T) toc_jump ;;
+      c|C) copy_section ;;
+      x|X) check_item ;;
+      l|L) open_link ;;
+      e|E) edit_in_pane ;;
+      o|O) open_in_gui ;;
+      r|R) img_forget_all; reload_file ;;
+      /) do_search ;;
+      n) [[ -n $search_term ]] && { find_matches; jump_match $(( search_idx + 1 )) } ;;
+      N) [[ -n $search_term ]] && { find_matches; jump_match $(( search_idx - 1 )) } ;;
+      $'\e') [[ -n $search_term ]] && { search_term=""; search_matches=(); match_set=(); search_idx=0; paint } ;;
+      j|$'\e[B') coalesce_scroll; apply_scroll $(( 1 + COAL_D )); paint ;;
+      k|$'\e[A') coalesce_scroll; apply_scroll $(( -1 + COAL_D )); paint ;;
+      ' '|f|$'\e[6~') (( offset += page )); paint ;;
+      b|$'\e[5~') (( offset -= page )); paint ;;
+      d) (( offset += page / 2 )); paint ;;
+      u) (( offset -= page / 2 )); paint ;;
+      g|$'\e[H') offset=0; paint ;;
+      G|$'\e[F') offset=$(max_offset); paint ;;
+    esac
+  done
+else
+  # Not a terminal (piped or scripted): print the render once. With
+  # MDW_FOLLOW=1, keep watching and print a fresh render on every change.
+  rebuild
+  cat "$MDW_BUF"
+  if [[ $MDW_FOLLOW == 1 ]]; then
+    mdw_start_watchers
+    while :; do
+      cur=$(_mdw_mtime)
+      if [[ -e $MDW_DIRTY || $cur != $mdw_last_mtime ]]; then
+        rm -f "$MDW_DIRTY"; mdw_last_mtime=$cur
+        rebuild; print; cat "$MDW_BUF"
+      fi
+      sleep 0.5
+    done
+  fi
+fi
